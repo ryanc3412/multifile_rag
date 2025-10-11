@@ -1,0 +1,4 @@
+# Ignore local environment variable files
+# Keep `.env.example` committed as a template
+.env
+.env.*
