@@ -208,7 +208,8 @@ class FaissBackend(VectorStoreBackend):
 
 
 class SupabaseBackend(VectorStoreBackend):
-    """Stub for future Supabase vector store. Implement the same methods as FaissBackend.
+    """
+    Stub for future Supabase vector store. Implement the same methods as FaissBackend.
 
     TODO: Implement actual HTTP/pg client calls. When porting:
       - Store chunk text in `content` column
@@ -234,7 +235,8 @@ class SupabaseBackend(VectorStoreBackend):
 
 
 def embed_texts(texts: List[str], model: str = "text-embedding-3-small", batch_size: int = 50, max_retries: int = 3, retry_backoff: float = 1.0) -> np.ndarray:
-    """Embed a list of texts using OpenAI embeddings API in batches.
+    """
+    Embed a list of texts using OpenAI embeddings API in batches (50 chunks at a time).
 
     Returns:
         numpy.ndarray of shape (len(texts), dim)
@@ -266,7 +268,8 @@ def embed_texts(texts: List[str], model: str = "text-embedding-3-small", batch_s
 
 
 def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[dict]:
-    """Split text into overlapping chunks trying to preserve sentence boundaries.
+    """
+    Split text into overlapping chunks trying to preserve sentence boundaries.
 
     Args:
         text: The text to split into chunks
@@ -315,10 +318,15 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[dict
         chunk_id += 1
 
         # move forward accounting for overlap
-        start = max(split_pos - overlap, split_pos if split_pos == end else split_pos - overlap)
-        if start <= split_pos:
-            # avoid infinite loops
+        prev_start = start
+        # desired next start to include `overlap` characters from the previous chunk
+        next_start = split_pos - overlap
+        # ensure we always make forward progress; if next_start would not advance
+        # beyond prev_start, fall back to split_pos (no overlap) to avoid infinite loops
+        if next_start <= prev_start:
             start = split_pos
+        else:
+            start = next_start
 
     return chunks
 
