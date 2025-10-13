@@ -2,3 +2,16 @@
 # Keep `.env.example` committed as a template
 .env
 .env.*
+
+# Virtual environment directories
+venv/
+env/
+
+# Ignore the generated FAISS index and metadata
+indexes/
+
+# Ignore the source documents
+documents/
+
+# Ignore Python's cache files
+__pycache__/

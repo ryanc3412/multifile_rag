@@ -1,0 +1,7 @@
+python-dotenv
+openai
+python-docx
+faiss-cpu
+numpy
+typing-extensions
+pytest
