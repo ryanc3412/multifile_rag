@@ -21,8 +21,6 @@ def main() -> None:
     parser.add_argument("--search", type=str, help="Search query")
     parser.add_argument("--k", type=int, default=5, help="Number of neighbors to return")
     parser.add_argument("--persist", type=str, default="indexes", help="Persist directory for FAISS index")
-    parser.add_argument("--chunk-size", type=int, default=300, help="Maximum characters per chunk (default: 300)")
-    parser.add_argument("--overlap", type=int, default=50, help="Number of characters to overlap between chunks (default: 50)")
 
     args = parser.parse_args()
 
@@ -30,9 +28,8 @@ def main() -> None:
 
     if args.index:
         dirp = Path(args.index)
-        logger.info("Indexing directory %s with chunk_size=%d, overlap=%d", 
-                   dirp, args.chunk_size, args.overlap)
-        index_documents(str(dirp), backend, chunk_size=args.chunk_size, overlap=args.overlap)
+        logger.info("Indexing directory %s", dirp)
+        index_documents(str(dirp), backend)
 
     if args.search:
         results = search(args.search, backend, k=args.k)

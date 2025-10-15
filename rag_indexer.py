@@ -29,7 +29,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Any
+from typing import Any, Optional
 
 import numpy as np
 from openai import OpenAI
@@ -54,6 +54,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY not found in environment. Embedding calls will fail until set.")
 
+# Centralize embedding model here to avoid accidental mismatches between
+# indexing and query-time embeddings. Change in one place only.
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+# Fixed chunk size and overlap values optimized for grant writing RAG system
+# Large enough to capture context while small enough for precise retrieval
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 500))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 100))
+
 
 class VectorStoreBackend(ABC):
     """
@@ -64,7 +73,7 @@ class VectorStoreBackend(ABC):
     """
 
     @abstractmethod
-    def add_vectors(self, embeddings: np.ndarray, metadatas: List[dict]) -> None:
+    def add_vectors(self, embeddings: np.ndarray, metadatas: list[dict]) -> None:
         """
         Add vectors with associated metadata. Embeddings should be 2D numpy array.
 
@@ -74,7 +83,7 @@ class VectorStoreBackend(ABC):
         """
 
     @abstractmethod
-    def search(self, embedding: np.ndarray, k: int) -> List[Tuple[int, float]]:
+    def search(self, embedding: np.ndarray, k: int) -> list[tuple[int, float]]:
         """
         Search and return list of tuples (idx, score). Score semantics depend on backend.
 
@@ -107,29 +116,37 @@ class FaissBackend(VectorStoreBackend):
     persist_dir: str = "indexes"
     index_filename: str = "faiss.index"
     meta_filename: str = "faiss_meta.jsonl"
-    dimension: int = 1536  # default for many OpenAI embedding models; updated on first add
+    # If None, we create the FAISS index lazily when embeddings are first added.
+    # Avoids hardcoding a default dimension which can mismatch newer embedding models.
+    dimension: Optional[int] = None
 
     def __post_init__(self):
         self.persist_dir = Path(self.persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.persist_dir / self.index_filename
         self.meta_path = self.persist_dir / self.meta_filename
-        self._metadatas: List[dict] = []
+        self._metadatas: list[dict] = []
         self._index: Any = None
-        self._d = self.dimension
+        # _d holds the configured/index dimension. None means unknown until we see embeddings.
+        self._d: Optional[int] = self.dimension
         # deterministic seed for tests (faiss IndexFlat doesn't use RNG, but keep for future)
         np.random.seed(42)
 
+        # If persisted index exists, load it (this will set _d). Otherwise, don't
+        # create an index now if dimension is unknown — wait until first add_vectors
         if self.index_path.exists() and self.meta_path.exists():
             try:
                 self.load()
             except Exception:
                 logger.exception("Failed to load existing index; starting fresh.")
-                self._create_index(self._d)
-        else:
-            self._create_index(self._d)
+                # If a default dimension was provided, create an index; otherwise lazy-create later
+                if self._d is not None:
+                    self._create_index(self._d)
 
     def _create_index(self, d: int):
+        """Create a FAISS index of dimension d. d must be a positive integer."""
+        if not isinstance(d, int) or d <= 0:
+            raise ValueError("Dimension must be a positive integer to create FAISS index")
         self._d = d
         # Use inner product over normalized vectors to represent cosine similarity
         if faiss is None:
@@ -137,7 +154,7 @@ class FaissBackend(VectorStoreBackend):
         self._index = faiss.IndexFlatIP(d)
         logger.info("Created new FAISS IndexFlatIP with dimension=%d", d)
 
-    def add_vectors(self, embeddings: np.ndarray, metadatas: List[dict]) -> None:
+    def add_vectors(self, embeddings: np.ndarray, metadatas: list[dict]) -> None:
         if embeddings.ndim != 2:
             raise ValueError("embeddings must be 2D numpy array")
         n, d = embeddings.shape
@@ -160,7 +177,7 @@ class FaissBackend(VectorStoreBackend):
         self._metadatas.extend(metadatas)
         logger.info("Added %d vectors to FAISS index (total=%d)", n, self._index.ntotal)
 
-    def search(self, embedding: np.ndarray, k: int) -> List[Tuple[int, float]]:
+    def search(self, embedding: np.ndarray, k: int) -> list[tuple[int, float]]:
         if self._index is None:
             raise RuntimeError("Index not initialized")
         if embedding.ndim == 1:
@@ -172,7 +189,7 @@ class FaissBackend(VectorStoreBackend):
 
         D, I = self._index.search(emb_norm, k)
         # D is similarity (inner product); convert to distance where lower is better
-        results: List[Tuple[int, float]] = []
+        results: list[tuple[int, float]] = []
         for idx, sim in zip(I[0], D[0]):
             if idx == -1:
                 continue
@@ -221,10 +238,10 @@ class SupabaseBackend(VectorStoreBackend):
     def __init__(self, *args, **kwargs):
         raise NotImplementedError("SupabaseBackend is a stub. Replace FaissBackend with SupabaseBackend here when ready.")
 
-    def add_vectors(self, embeddings: np.ndarray, metadatas: List[dict]) -> None:
+    def add_vectors(self, embeddings: np.ndarray, metadatas: list[dict]) -> None:
         raise NotImplementedError()
 
-    def search(self, embedding: np.ndarray, k: int) -> List[Tuple[int, float]]:
+    def search(self, embedding: np.ndarray, k: int) -> list[tuple[int, float]]:
         raise NotImplementedError()
 
     def save(self) -> None:
@@ -234,7 +251,7 @@ class SupabaseBackend(VectorStoreBackend):
         raise NotImplementedError()
 
 
-def embed_texts(texts: List[str], model: str = "text-embedding-3-small", batch_size: int = 50, max_retries: int = 3, retry_backoff: float = 1.0) -> np.ndarray:
+def embed_texts(texts: list[str], model: str | None = None, batch_size: int = 50, max_retries: int = 3, retry_backoff: float = 1.0) -> np.ndarray:
     """
     Embed a list of texts using OpenAI embeddings API in batches (50 chunks at a time).
 
@@ -244,8 +261,11 @@ def embed_texts(texts: List[str], model: str = "text-embedding-3-small", batch_s
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set in environment")
 
+    if model is None:
+        model = EMBEDDING_MODEL
+
     client = OpenAI(api_key=OPENAI_API_KEY)
-    all_embs: List[np.ndarray] = []
+    all_embs: list[np.ndarray] = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
         attempt = 0
@@ -267,14 +287,12 @@ def embed_texts(texts: List[str], model: str = "text-embedding-3-small", batch_s
     return np.vstack(all_embs)
 
 
-def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[dict]:
+def chunk_text(text: str) -> list[dict]:
     """
     Split text into overlapping chunks trying to preserve sentence boundaries.
 
     Args:
         text: The text to split into chunks
-        chunk_size: Maximum characters per chunk (default: 300)
-        overlap: Number of characters to overlap between chunks (default: 50)
     
     The function tries to split on natural boundaries in this order:
     1. Newlines (\n)
@@ -284,24 +302,24 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[dict
 
     Returns list of dicts: {'text':..., 'start': int, 'end': int}
     """
-    if chunk_size <= overlap:
-        raise ValueError("chunk_size must be larger than overlap")
+    if CHUNK_SIZE <= CHUNK_OVERLAP:
+        raise ValueError("CHUNK_SIZE must be larger than CHUNK_OVERLAP")
 
     separators = ["\n", ". ", "? ", "! "]
 
     length = len(text)
     start = 0
-    chunks: List[dict] = []
+    chunks: list[dict] = []
     chunk_id = 0
 
     while start < length:
-        end = min(start + chunk_size, length)
+        end = min(start + CHUNK_SIZE, length)
         window = text[start:end]
         split_pos = None
         # try to split near the end of window on preferred separators
         for sep in separators:
             pos = window.rfind(sep)
-            if pos != -1 and pos + len(sep) >= chunk_size - 100:  # favor near end
+            if pos != -1 and pos + len(sep) >= CHUNK_SIZE - 100:  # favor near end
                 split_pos = start + pos + len(sep)
                 break
         if split_pos is None and end < length:
@@ -320,7 +338,7 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[dict
         # move forward accounting for overlap
         prev_start = start
         # desired next start to include `overlap` characters from the previous chunk
-        next_start = split_pos - overlap
+        next_start = split_pos - CHUNK_OVERLAP
         # ensure we always make forward progress; if next_start would not advance
         # beyond prev_start, fall back to split_pos (no overlap) to avoid infinite loops
         if next_start <= prev_start:
@@ -331,7 +349,7 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[dict
     return chunks
 
 
-def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: str | None = None, chunk_size: int = 600, overlap: int = 120):
+def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: str | None = None):
     """Index all .docx files in dir_path using provided backend and persist results.
 
     Args:
@@ -343,8 +361,12 @@ def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: st
     if not p.exists() or not p.is_dir():
         raise ValueError(f"dir_path {dir_path} does not exist or is not a directory")
 
-    texts: List[str] = []
-    metadatas: List[dict] = []
+    texts: list[str] = []
+    metadatas: list[dict] = []
+
+    # TODO: Add support for other file types (PDF, TXT)
+    # Make helper functions to load different file types
+    # Look into langchain_community document loaders 
 
     for docx_file in sorted(p.glob("*.docx")):
         try:
@@ -357,7 +379,7 @@ def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: st
             logger.info("File %s is empty; skipping", docx_file.name)
             continue
 
-        chunks = chunk_text(full_text, chunk_size=chunk_size, overlap=overlap)
+        chunks = chunk_text(full_text)
         for c in chunks:
             texts.append(c["text"])
             metadatas.append({
@@ -366,6 +388,8 @@ def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: st
                 "start_offset": int(c["start"]),
                 "end_offset": int(c["end"]),
                 "text": c["text"],
+                # record which embedding model was used to create these vectors
+                "embedding_model": EMBEDDING_MODEL,
             })
 
     if not texts:
@@ -377,15 +401,25 @@ def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: st
     backend.save()
 
 
-def search(query: str, backend: FaissBackend, k: int = 5, model: str = "text-embedding-3-small") -> List[dict]:
+def search(query: str, backend: FaissBackend, k: int = 5) -> list[dict]:
     """Search the vector store and return JSON-serializable hits.
 
     Returns list of dicts with keys: quote, source_file, chunk_id, start_offset, end_offset, score
     Score is a distance where lower is better (0 = identical under cosine similarity approximation).
     """
-    q_emb = embed_texts([query], model=model)
+    # Use the centralized embedding model for queries as well. This avoids the
+    # common pitfall where index_documents used one model and search used another.
+    q_emb = embed_texts([query], model=EMBEDDING_MODEL)
+
+    # defensive runtime check: ensure embedding dimension matches index
+    if backend._d is not None and q_emb.shape[1] != backend._d:
+        raise RuntimeError(
+            f"Embedding dimension mismatch: query embedding dim={q_emb.shape[1]} "
+            f"but index expects dim={backend._d}. This often means the embedding model "
+            "used for indexing differs from the query embedding model."
+        )
     hits = backend.search(q_emb[0], k)
-    results: List[dict] = []
+    results: list[dict] = []
     for idx, score in hits:
         meta = backend.get_metadata(idx)
         results.append(
@@ -396,6 +430,7 @@ def search(query: str, backend: FaissBackend, k: int = 5, model: str = "text-emb
                 "start_offset": meta.get("start_offset"),
                 "end_offset": meta.get("end_offset"),
                 "score": score,
+                "embedding_model": meta.get("embedding_model"),
             }
         )
     return results
