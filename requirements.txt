@@ -5,3 +5,4 @@ faiss-cpu
 numpy
 typing-extensions
 pytest
+pymupdf

@@ -35,6 +35,7 @@ import numpy as np
 from openai import OpenAI
 from dotenv import load_dotenv
 from docx import Document
+import fitz  # PyMuPDF
 
 # Configure logging early so import-time errors can log cleanly
 logger = logging.getLogger(__name__)
@@ -389,11 +390,46 @@ def chunk_text(text: str) -> list[dict]:
     return chunks
 
 
+def load_docx(file_path: Path) -> str:
+    """Load text content from a .docx file."""
+    try:
+        doc = Document(file_path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        return text
+    except Exception:
+        logger.exception("Failed to open DOCX file %s", file_path)
+        return ""
+
+def load_pdf(file_path: Path) -> str:
+    """
+    Load text content from a PDF file using PyMuPDF.
+    Preserves document structure and handles complex layouts better than other libraries.
+    """
+    try:
+        doc = fitz.open(file_path)
+        text_parts = []
+        
+        for page in doc:
+            # Get text blocks with better layout preservation
+            blocks = page.get_text("blocks")
+            # Sort blocks by vertical position then horizontal for natural reading order
+            blocks.sort(key=lambda b: (b[1], b[0]))  # sort by y, then x coordinate
+            # Extract clean text from each block
+            page_text = "\n".join(block[4] for block in blocks if block[4].strip())
+            if page_text.strip():
+                text_parts.append(page_text)
+        
+        doc.close()
+        return "\n\n".join(text_parts)
+    except Exception:
+        logger.exception("Failed to open PDF file %s", file_path)
+        return ""
+
 def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: str | None = None):
-    """Index all .docx files in dir_path using provided backend and persist results.
+    """Index files in dir_path using provided backend and persist results.
 
     Args:
-        dir_path: directory containing .docx files
+        dir_path: directory containing documents (.docx, .pdf)
         backend: VectorStoreBackend implementation (FaissBackend for now)
         persist_path: optional path to persist index/metadata; used by backend
     """
@@ -404,19 +440,22 @@ def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: st
     texts: list[str] = []
     metadatas: list[dict] = []
 
-    # TODO: Add support for other file types (PDF, TXT)
-    # Make helper functions to load different file types
-    # Look into langchain_community document loaders 
+    # Process both .docx and .pdf files
+    supported_files = list(p.glob("*.docx")) + list(p.glob("*.pdf"))
+    supported_files.sort()  # Sort for consistent ordering
 
-    for docx_file in sorted(p.glob("*.docx")):
-        try:
-            doc = Document(docx_file)
-        except Exception:
-            logger.exception("Failed to open %s; skipping", docx_file)
+    for file_path in supported_files:
+        # Choose appropriate loader based on file extension
+        if file_path.suffix.lower() == ".docx":
+            full_text = load_docx(file_path)
+        elif file_path.suffix.lower() == ".pdf":
+            full_text = load_pdf(file_path)
+        else:
+            logger.warning("Unsupported file type: %s", file_path)
             continue
-        full_text = "\n".join(p.text for p in doc.paragraphs)
+
         if not full_text.strip():
-            logger.info("File %s is empty; skipping", docx_file.name)
+            logger.info("File %s is empty or failed to load; skipping", file_path.name)
             continue
 
         chunks = chunk_text(full_text)
