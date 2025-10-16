@@ -34,8 +34,10 @@ from typing import Any, Optional
 import numpy as np
 from openai import OpenAI
 from dotenv import load_dotenv
-from docx import Document
-import fitz  # PyMuPDF
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.document_loaders import UnstructuredWordDocumentLoader
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # Configure logging early so import-time errors can log cleanly
 logger = logging.getLogger(__name__)
@@ -159,6 +161,19 @@ class FaissBackend(VectorStoreBackend):
         if embeddings.ndim != 2:
             raise ValueError("embeddings must be 2D numpy array")
         n, d = embeddings.shape
+        
+        if len(metadatas) != n:
+            raise ValueError(f"Metadata count ({len(metadatas)}) must match embedding count ({n})")
+        
+        # Validate metadata structure
+        required_keys = {"source_file", "chunk_id", "text", "page_number"}
+        for i, meta in enumerate(metadatas):
+            if not isinstance(meta, dict):
+                raise ValueError(f"Metadata {i} must be a dictionary")
+            missing_keys = required_keys - set(meta.keys())
+            if missing_keys:
+                raise ValueError(f"Metadata {i} missing required keys: {missing_keys}")
+        
         if self._index is None:
             self._create_index(d)
         if d != self._d:
@@ -261,169 +276,50 @@ def embed_texts(texts: list[str], model: str | None = None, batch_size: int = 50
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set in environment")
+    
+    if not texts:
+        raise ValueError("No texts provided for embedding")
+    
+    # Validate text lengths (OpenAI has limits)
+    max_tokens = 8191  # text-embedding-3-small limit
+    for i, text in enumerate(texts):
+        if len(text) > max_tokens * 4:  # Rough estimate: 4 chars per token
+            logger.warning("Text %d is very long (%d chars), may exceed token limits", i, len(text))
 
     if model is None:
         model = EMBEDDING_MODEL
 
     client = OpenAI(api_key=OPENAI_API_KEY)
     all_embs: list[np.ndarray] = []
+    total_batches = (len(texts) + batch_size - 1) // batch_size
+    
     for i in range(0, len(texts), batch_size):
+        batch_num = (i // batch_size) + 1
         batch = texts[i : i + batch_size]
+        
+        logger.info("Processing batch %d/%d (%d texts)", batch_num, total_batches, len(batch))
+        
         attempt = 0
         while True:
             try:
                 resp = client.embeddings.create(input=batch, model=model)
                 batch_embs = [np.array(item.embedding, dtype=np.float32) for item in resp.data]
                 all_embs.extend(batch_embs)
+                logger.debug("Successfully embedded batch %d/%d", batch_num, total_batches)
                 break
             except Exception as e:
                 attempt += 1
                 if attempt > max_retries:
-                    logger.exception("Failed to get embeddings after %d attempts", attempt)
+                    logger.exception("Failed to get embeddings after %d attempts for batch %d", attempt, batch_num)
                     raise
                 wait = retry_backoff * (2 ** (attempt - 1))
-                logger.warning("Embedding request failed (attempt=%d). Retrying in %.1fs. Error: %s", attempt, wait, str(e))
+                logger.warning("Embedding request failed (attempt=%d, batch=%d). Retrying in %.1fs. Error: %s", 
+                              attempt, batch_num, wait, str(e))
                 time.sleep(wait)
 
+    logger.info("Successfully generated embeddings for %d texts", len(texts))
     return np.vstack(all_embs)
 
-def chunk_text(text: str) -> list[dict]:
-    """
-    Split text into overlapping chunks trying to preserve sentence boundaries and word boundaries.
-
-    Returns list of dicts: {'text':..., 'start': int, 'end': int, 'chunk_id': int}
-    """
-    if CHUNK_SIZE <= CHUNK_OVERLAP:
-        raise ValueError("CHUNK_SIZE must be larger than CHUNK_OVERLAP")
-
-    def find_word_boundary(pos: int, forward: bool = True) -> int:
-        """Find the nearest word boundary (space) in either direction."""
-        if forward:
-            while pos < length and text[pos] != " ":
-                pos += 1
-            return pos
-        else:
-            # Walk backwards until we hit a space or start of text
-            while pos > 0 and text[pos - 1] != " ":
-                pos -= 1
-            return pos
-
-    # Prefer multi-char separators that include trailing space so next chunk starts cleanly.
-    # Order matters: higher-priority separators come first.
-    multi_sep = ["\n", ". ", "? ", "! "]
-    single_sep = [".", "?", "!"]
-    length = len(text)
-    start = 0
-    chunks: list[dict] = []
-    chunk_id = 0
-
-    min_split_point = CHUNK_SIZE - CHUNK_OVERLAP  # require this many chars before a natural split
-
-    # Ensure we start at a clean word boundary
-    start = find_word_boundary(start, forward=False)
-
-    while start < length:
-        end = min(start + CHUNK_SIZE, length)
-        window = text[start:end]
-
-        best_abs_split = None
-
-        # 1) Try multi-char separators (exact match) searching for the last occurrence in window
-        for sep in multi_sep:
-            pos = window.rfind(sep)
-            if pos != -1 and (pos + len(sep)) >= min_split_point:
-                # split after the separator so next chunk begins cleanly
-                candidate = start + pos + len(sep)
-                # choose the candidate nearest the window end (largest pos)
-                if best_abs_split is None or candidate > best_abs_split:
-                    best_abs_split = candidate
-
-        # 2) If no multi-char sep found, try single-char punctuation but enforce min_split_point
-        if best_abs_split is None:
-            for sep in single_sep:
-                pos = window.rfind(sep)
-                if pos != -1 and (pos + 1) >= min_split_point:
-                    candidate = start + pos + 1
-                    if best_abs_split is None or candidate > best_abs_split:
-                        best_abs_split = candidate
-
-        # 3) Fallback to last word boundary if it's after the min_split_point
-        if best_abs_split is None and end < length:
-            pos = window.rfind(" ")
-            if pos != -1 and pos >= min_split_point:
-                best_abs_split = start + pos + 1  # split after the space for clean word boundary
-            else:
-                # If no natural boundary found, force a word boundary near the end
-                best_abs_split = find_word_boundary(end, forward=False)
-
-        # 4) If still none, use end (hard cut). But ensure forward progress
-        if best_abs_split is None:
-            split_pos = end
-        else:
-            split_pos = min(best_abs_split, end)
-
-        # Safety: ensure split_pos > start (force minimal progress if necessary)
-        if split_pos <= start:
-            # advance by at least 1 character (or half chunk size) to avoid infinite loops on pathological input
-            forced = min(length, start + max(1, CHUNK_SIZE // 2))
-            split_pos = forced
-
-        # Clean up chunk text and ensure it starts/ends at word boundaries
-        chunk_text_str = text[start:split_pos].strip()
-        chunks.append({
-            "text": chunk_text_str,
-            "start": start,
-            "end": split_pos,
-            "chunk_id": chunk_id
-        })
-        chunk_id += 1
-
-        # compute next start using overlap, but ensure it advances and starts at a word boundary
-        next_start = split_pos - CHUNK_OVERLAP
-        next_start = find_word_boundary(next_start, forward=False)  # move to previous word boundary
-        
-        if next_start <= start:
-            start = split_pos  # no overlap if that'll cause no progress
-        else:
-            start = next_start
-
-    return chunks
-
-
-def load_docx(file_path: Path) -> str:
-    """Load text content from a .docx file."""
-    try:
-        doc = Document(file_path)
-        text = "\n".join(p.text for p in doc.paragraphs)
-        return text
-    except Exception:
-        logger.exception("Failed to open DOCX file %s", file_path)
-        return ""
-
-def load_pdf(file_path: Path) -> str:
-    """
-    Load text content from a PDF file using PyMuPDF.
-    Preserves document structure and handles complex layouts better than other libraries.
-    """
-    try:
-        doc = fitz.open(file_path)
-        text_parts = []
-        
-        for page in doc:
-            # Get text blocks with better layout preservation
-            blocks = page.get_text("blocks")
-            # Sort blocks by vertical position then horizontal for natural reading order
-            blocks.sort(key=lambda b: (b[1], b[0]))  # sort by y, then x coordinate
-            # Extract clean text from each block
-            page_text = "\n".join(block[4] for block in blocks if block[4].strip())
-            if page_text.strip():
-                text_parts.append(page_text)
-        
-        doc.close()
-        return "\n\n".join(text_parts)
-    except Exception:
-        logger.exception("Failed to open PDF file %s", file_path)
-        return ""
 
 def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: str | None = None):
     """Index files in dir_path using provided backend and persist results.
@@ -437,53 +333,144 @@ def index_documents(dir_path: str, backend: VectorStoreBackend, persist_path: st
     if not p.exists() or not p.is_dir():
         raise ValueError(f"dir_path {dir_path} does not exist or is not a directory")
 
+    # Validate configuration
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is required for indexing. Please set it in your .env file.")
+    
+    if CHUNK_SIZE <= 0 or CHUNK_OVERLAP < 0:
+        raise ValueError(f"Invalid chunk configuration: CHUNK_SIZE={CHUNK_SIZE}, CHUNK_OVERLAP={CHUNK_OVERLAP}")
+
+    # Set up text splitter with improved separators for better context preservation
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n\n", "\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
+    )
+    
     texts: list[str] = []
     metadatas: list[dict] = []
+    chunk_id = 0
+    processed_files = 0
+    failed_files = 0
 
     # Process both .docx and .pdf files
     supported_files = list(p.glob("*.docx")) + list(p.glob("*.pdf"))
     supported_files.sort()  # Sort for consistent ordering
+    
+    if not supported_files:
+        logger.warning("No supported files (.docx, .pdf) found in %s", dir_path)
+        return
+    
+    logger.info("Found %d files to process in %s", len(supported_files), dir_path)
 
     for file_path in supported_files:
-        # Choose appropriate loader based on file extension
-        if file_path.suffix.lower() == ".docx":
-            full_text = load_docx(file_path)
-        elif file_path.suffix.lower() == ".pdf":
-            full_text = load_pdf(file_path)
-        else:
-            logger.warning("Unsupported file type: %s", file_path)
-            continue
+        try:
+            logger.info("Processing file: %s", file_path.name)
+            
+            # Get appropriate loader based on file type
+            if file_path.suffix.lower() == ".docx":
+                loader = UnstructuredWordDocumentLoader(str(file_path))
+            elif file_path.suffix.lower() == ".pdf":
+                loader = PyMuPDFLoader(str(file_path))
+            else:
+                logger.warning("Unsupported file type: %s", file_path)
+                continue
 
-        if not full_text.strip():
-            logger.info("File %s is empty or failed to load; skipping", file_path.name)
+            # Load documents - handle both single and multi-page documents
+            docs = loader.load()
+            if not docs:
+                logger.warning("No content extracted from %s", file_path.name)
+                continue
+            
+            file_chunk_count = 0
+            # Process each document (PDFs may have multiple pages as separate docs)
+            for doc_idx, doc in enumerate(docs):
+                if not doc.page_content or not doc.page_content.strip():
+                    logger.warning("Empty content in %s (doc %d)", file_path.name, doc_idx)
+                    continue
+                
+                # Extract page number from metadata
+                page_number = None
+                if file_path.suffix.lower() == ".pdf":
+                    # PyMuPDFLoader provides page info in metadata
+                    page_number = doc.metadata.get('page', 0) + 1  # Convert 0-based to 1-based
+                    logger.debug("PDF page number extracted: %d for doc %d", page_number, doc_idx)
+                elif file_path.suffix.lower() == ".docx":
+                    # Word documents don't have reliable page info from UnstructuredWordDocumentLoader
+                    # For multi-page Word docs, we can estimate based on content length
+                    # Rough estimate: ~500-1000 chars per page for typical documents
+                    content_length = len(doc.page_content)
+                    estimated_pages = max(1, content_length // 750)  # ~750 chars per page estimate
+                    
+                    # For now, we'll use a simple approach: if this is the first doc from a Word file,
+                    # assume it's page 1. In the future, we could implement more sophisticated
+                    # page detection by analyzing the content for page breaks.
+                    page_number = 1
+                    logger.debug("Word doc estimated pages: %d, using page 1 for doc %d", estimated_pages, doc_idx)
+                
+                # Fallback: if page_number is still None, set to 1
+                if page_number is None:
+                    page_number = 1
+                    logger.warning("Could not determine page number for %s doc %d, defaulting to 1", file_path.name, doc_idx)
+                
+                chunks = text_splitter.create_documents([doc.page_content])
+                
+                if not chunks:
+                    logger.warning("No chunks created from %s (doc %d)", file_path.name, doc_idx)
+                    continue
+                
+                for chunk in chunks:
+                    # Skip very short chunks that are likely not meaningful
+                    if len(chunk.page_content.strip()) < 50:
+                        continue
+                        
+                    texts.append(chunk.page_content)
+                    metadatas.append({
+                        "source_file": file_path.name,
+                        "chunk_id": chunk_id,
+                        "start_offset": 0,  # LangChain doesn't provide char offsets
+                        "end_offset": len(chunk.page_content),
+                        "text": chunk.page_content,
+                        "embedding_model": EMBEDDING_MODEL,
+                        "file_size": file_path.stat().st_size,
+                        "file_modified": file_path.stat().st_mtime,
+                        "page_number": page_number,
+                    })
+                    chunk_id += 1
+                    file_chunk_count += 1
+            
+            logger.info("Created %d chunks from %s", file_chunk_count, file_path.name)
+            processed_files += 1
+                
+        except Exception as e:
+            logger.exception("Failed to process file %s: %s", file_path, str(e))
+            failed_files += 1
             continue
-
-        chunks = chunk_text(full_text)
-        for c in chunks:
-            texts.append(c["text"])
-            metadatas.append({
-                "source_file": docx_file.name,
-                "chunk_id": int(c["chunk_id"]),
-                "start_offset": int(c["start"]),
-                "end_offset": int(c["end"]),
-                "text": c["text"],
-                # record which embedding model was used to create these vectors
-                "embedding_model": EMBEDDING_MODEL,
-            })
 
     if not texts:
         logger.warning("No documents found to index in %s", dir_path)
         return
+    
+    logger.info("Processing complete: %d files processed, %d failed, %d total chunks", 
+                processed_files, failed_files, len(texts))
 
-    embeddings = embed_texts(texts)
-    backend.add_vectors(embeddings, metadatas)
-    backend.save()
+    try:
+        logger.info("Generating embeddings for %d chunks...", len(texts))
+        embeddings = embed_texts(texts)
+        logger.info("Adding vectors to backend...")
+        backend.add_vectors(embeddings, metadatas)
+        logger.info("Saving index...")
+        backend.save()
+        logger.info("Indexing completed successfully!")
+    except Exception as e:
+        logger.exception("Failed during embedding or indexing: %s", str(e))
+        raise
 
 
 def search(query: str, backend: FaissBackend, k: int = 5) -> list[dict]:
     """Search the vector store and return JSON-serializable hits.
 
-    Returns list of dicts with keys: quote, source_file, chunk_id, start_offset, end_offset, score
+    Returns list of dicts with keys: quote, source_file, chunk_id, start_offset, end_offset, score, page_number
     Score is a distance where lower is better (0 = identical under cosine similarity approximation).
     """
     # Use the centralized embedding model for queries as well. This avoids the
@@ -510,6 +497,7 @@ def search(query: str, backend: FaissBackend, k: int = 5) -> list[dict]:
                 "end_offset": meta.get("end_offset"),
                 "score": score,
                 "embedding_model": meta.get("embedding_model"),
+                "page_number": meta.get("page_number"),
             }
         )
     return results

@@ -1,8 +1,10 @@
 python-dotenv
 openai
-python-docx
 faiss-cpu
 numpy
 typing-extensions
 pytest
+langchain-community
+langchain-core
 pymupdf
+unstructured

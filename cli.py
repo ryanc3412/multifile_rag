@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--index", type=str, help="Directory of .docx files to index")
+    parser.add_argument("--index", type=str, help="Directory of .docx and .pdf files to index")
     parser.add_argument("--search", type=str, help="Search query")
     parser.add_argument("--k", type=int, default=5, help="Number of neighbors to return")
     parser.add_argument("--persist", type=str, default="indexes", help="Persist directory for FAISS index")
