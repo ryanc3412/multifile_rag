@@ -286,63 +286,103 @@ def embed_texts(texts: list[str], model: str | None = None, batch_size: int = 50
 
     return np.vstack(all_embs)
 
-
 def chunk_text(text: str) -> list[dict]:
     """
-    Split text into overlapping chunks trying to preserve sentence boundaries.
+    Split text into overlapping chunks trying to preserve sentence boundaries and word boundaries.
 
-    Args:
-        text: The text to split into chunks
-    
-    The function tries to split on natural boundaries in this order:
-    1. Newlines (\n)
-    2. End of sentences (. ? !)
-    3. Spaces between words
-    4. Hard cut if no natural breaks found
-
-    Returns list of dicts: {'text':..., 'start': int, 'end': int}
+    Returns list of dicts: {'text':..., 'start': int, 'end': int, 'chunk_id': int}
     """
     if CHUNK_SIZE <= CHUNK_OVERLAP:
         raise ValueError("CHUNK_SIZE must be larger than CHUNK_OVERLAP")
 
-    separators = ["\n", ". ", "? ", "! "]
+    def find_word_boundary(pos: int, forward: bool = True) -> int:
+        """Find the nearest word boundary (space) in either direction."""
+        if forward:
+            while pos < length and text[pos] != " ":
+                pos += 1
+            return pos
+        else:
+            # Walk backwards until we hit a space or start of text
+            while pos > 0 and text[pos - 1] != " ":
+                pos -= 1
+            return pos
 
+    # Prefer multi-char separators that include trailing space so next chunk starts cleanly.
+    # Order matters: higher-priority separators come first.
+    multi_sep = ["\n", ". ", "? ", "! "]
+    single_sep = [".", "?", "!"]
     length = len(text)
     start = 0
     chunks: list[dict] = []
     chunk_id = 0
 
+    min_split_point = CHUNK_SIZE - CHUNK_OVERLAP  # require this many chars before a natural split
+
+    # Ensure we start at a clean word boundary
+    start = find_word_boundary(start, forward=False)
+
     while start < length:
         end = min(start + CHUNK_SIZE, length)
         window = text[start:end]
-        split_pos = None
-        # try to split near the end of window on preferred separators
-        for sep in separators:
+
+        best_abs_split = None
+
+        # 1) Try multi-char separators (exact match) searching for the last occurrence in window
+        for sep in multi_sep:
             pos = window.rfind(sep)
-            if pos != -1 and pos + len(sep) >= CHUNK_SIZE - 100:  # favor near end
-                split_pos = start + pos + len(sep)
-                break
-        if split_pos is None and end < length:
-            # as fallback try to find last space
+            if pos != -1 and (pos + len(sep)) >= min_split_point:
+                # split after the separator so next chunk begins cleanly
+                candidate = start + pos + len(sep)
+                # choose the candidate nearest the window end (largest pos)
+                if best_abs_split is None or candidate > best_abs_split:
+                    best_abs_split = candidate
+
+        # 2) If no multi-char sep found, try single-char punctuation but enforce min_split_point
+        if best_abs_split is None:
+            for sep in single_sep:
+                pos = window.rfind(sep)
+                if pos != -1 and (pos + 1) >= min_split_point:
+                    candidate = start + pos + 1
+                    if best_abs_split is None or candidate > best_abs_split:
+                        best_abs_split = candidate
+
+        # 3) Fallback to last word boundary if it's after the min_split_point
+        if best_abs_split is None and end < length:
             pos = window.rfind(" ")
-            if pos != -1 and pos > 0:
-                split_pos = start + pos
+            if pos != -1 and pos >= min_split_point:
+                best_abs_split = start + pos + 1  # split after the space for clean word boundary
+            else:
+                # If no natural boundary found, force a word boundary near the end
+                best_abs_split = find_word_boundary(end, forward=False)
 
-        if split_pos is None:
+        # 4) If still none, use end (hard cut). But ensure forward progress
+        if best_abs_split is None:
             split_pos = end
+        else:
+            split_pos = min(best_abs_split, end)
 
-        chunk_text_str = text[start:split_pos]
-        chunks.append({"text": chunk_text_str, "start": start, "end": split_pos, "chunk_id": chunk_id})
+        # Safety: ensure split_pos > start (force minimal progress if necessary)
+        if split_pos <= start:
+            # advance by at least 1 character (or half chunk size) to avoid infinite loops on pathological input
+            forced = min(length, start + max(1, CHUNK_SIZE // 2))
+            split_pos = forced
+
+        # Clean up chunk text and ensure it starts/ends at word boundaries
+        chunk_text_str = text[start:split_pos].strip()
+        chunks.append({
+            "text": chunk_text_str,
+            "start": start,
+            "end": split_pos,
+            "chunk_id": chunk_id
+        })
         chunk_id += 1
 
-        # move forward accounting for overlap
-        prev_start = start
-        # desired next start to include `overlap` characters from the previous chunk
+        # compute next start using overlap, but ensure it advances and starts at a word boundary
         next_start = split_pos - CHUNK_OVERLAP
-        # ensure we always make forward progress; if next_start would not advance
-        # beyond prev_start, fall back to split_pos (no overlap) to avoid infinite loops
-        if next_start <= prev_start:
-            start = split_pos
+        next_start = find_word_boundary(next_start, forward=False)  # move to previous word boundary
+        
+        if next_start <= start:
+            start = split_pos  # no overlap if that'll cause no progress
         else:
             start = next_start
 
